@@ -2,6 +2,8 @@ import hashlib
 import hmac
 import json
 import unittest
+from datetime import datetime, timezone
+from uuid import UUID
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -9,15 +11,44 @@ from fastapi.testclient import TestClient
 from app import main
 from app.main import app
 from app.repositories.payment_repository import PaymentRepository
+from app.schemas.accounts import UserResponse
+from app.core.security import hash_access_token, hash_password, verify_password
 
 CUSTOMER_ID = "00000000-0000-0000-0000-000000000101"
+ADMIN_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 
 class PaymentAPITests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = PaymentRepository()
         main.payment_repository = self.repository
+        self.current_user = UserResponse(
+            id=ADMIN_ID,
+            email="admin@example.test",
+            role="admin",
+            customer_id=None,
+            created_at=datetime.now(timezone.utc),
+        )
+        app.dependency_overrides[main.get_current_user] = lambda: self.current_user
         self.client = TestClient(app)
+
+    def tearDown(self) -> None:
+        app.dependency_overrides.clear()
+
+    def test_login_openapi_example_uses_safe_admin_placeholder(self) -> None:
+        schema = app.openapi()
+        login_schema = schema["components"]["schemas"]["LoginRequest"]
+
+        self.assertEqual(
+            login_schema["examples"],
+            [
+                {
+                    "email": "admin@example.com",
+                    "password": "<INITIAL_ADMIN_PASSWORD>",
+                }
+            ],
+        )
+        self.assertIn("/api/v1/auth/login", schema["paths"])
 
     def test_create_payment_normalizes_currency_and_returns_contract(self) -> None:
         response = self.client.post(
@@ -190,6 +221,67 @@ class PaymentAPITests(unittest.TestCase):
         ])
         self.assertEqual(daily["items"][0]["count"], 2)
         self.assertEqual(daily["items"][0]["amount"], 300)
+
+    def test_customer_access_is_scoped_to_own_payments(self) -> None:
+        self.current_user = UserResponse(
+            id=UUID("00000000-0000-0000-0000-000000000002"),
+            email="customer@example.test",
+            role="customer",
+            customer_id=UUID(CUSTOMER_ID),
+            created_at=datetime.now(timezone.utc),
+        )
+        first = {
+            "reference": "OWN-001",
+            "amount": 100,
+            "currency": "IDR",
+            "customer_id": CUSTOMER_ID,
+            "method": "BANK_TRANSFER",
+        }
+        second = {**first, "reference": "OTHER-001", "customer_id": "00000000-0000-0000-0000-000000000102"}
+
+        self.assertEqual(self.client.post("/api/v1/payments", json=first).status_code, 201)
+        self.assertEqual(self.client.post("/api/v1/payments", json=second).status_code, 403)
+        self.assertEqual(len(self.client.get("/api/v1/payments").json()), 1)
+
+    def test_payment_routes_require_authentication(self) -> None:
+        app.dependency_overrides.clear()
+        response = self.client.get("/api/v1/payments")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["www-authenticate"], "Bearer")
+
+    def test_customer_role_cannot_access_admin_customer_list(self) -> None:
+        self.current_user = UserResponse(
+            id=UUID("00000000-0000-0000-0000-000000000002"),
+            email="customer@example.test",
+            role="customer",
+            customer_id=UUID(CUSTOMER_ID),
+            created_at=datetime.now(timezone.utc),
+        )
+        response = self.client.get("/api/v1/customers")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_profile_update_rejects_null_name(self) -> None:
+        self.current_user = UserResponse(
+            id=UUID("00000000-0000-0000-0000-000000000002"),
+            email="customer@example.test",
+            role="customer",
+            customer_id=UUID(CUSTOMER_ID),
+            created_at=datetime.now(timezone.utc),
+        )
+        response = self.client.patch("/api/v1/auth/me", json={"name": None})
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_passwords_are_hashed_and_tokens_are_not_stored_verbatim(self) -> None:
+        password_hash = hash_password("correct horse battery staple")
+        token = "sample-access-token"
+
+        self.assertNotEqual(password_hash, "correct horse battery staple")
+        self.assertTrue(verify_password("correct horse battery staple", password_hash))
+        self.assertFalse(verify_password("incorrect password", password_hash))
+        self.assertNotEqual(hash_access_token(token), token)
 
 
 if __name__ == "__main__":

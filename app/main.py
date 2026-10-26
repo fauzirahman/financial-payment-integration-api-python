@@ -4,13 +4,30 @@ import os
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.repositories.account_repository import AccountRepository
 from app.repositories.payment_repository import PostgresPaymentRepository
+from app.schemas.accounts import (
+    AuthResponse,
+    CustomerCreate,
+    CustomerResponse,
+    CustomerUpdate,
+    LoginRequest,
+    MessageResponse,
+    PaymentAccountCreate,
+    PaymentAccountResponse,
+    ProfileUpdate,
+    ProvisionCustomerAccountRequest,
+    RegisterRequest,
+    UserResponse,
+)
 from app.schemas.payment import (
     PaymentCreate,
     PaymentResponse,
@@ -19,10 +36,15 @@ from app.schemas.payment import (
 )
 
 payment_repository = PostgresPaymentRepository()
+account_repository = AccountRepository()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 app = FastAPI(
     title="Financial Payment Integration API",
-    description="Demo REST API untuk payment, webhook, dan laporan payment.",
+    description=(
+        "REST API untuk autentikasi, customer, payment account, payment, "
+        "webhook, dan laporan."
+    ),
     version="1.0.0",
 )
 
@@ -55,6 +77,284 @@ def health_check() -> dict[str, str]:
     }
 
 
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> UserResponse:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = account_repository.authenticate(credentials.credentials)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return UserResponse.model_validate(user)
+
+
+def require_admin(
+    current_user: UserResponse = Depends(get_current_user),
+) -> UserResponse:
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin role required")
+    return current_user
+
+
+def require_customer_access(customer_id: UUID, current_user: UserResponse) -> None:
+    if current_user.role != "admin" and current_user.customer_id != customer_id:
+        raise HTTPException(status_code=403, detail="customer access denied")
+
+
+@app.post(
+    "/api/v1/auth/register",
+    response_model=AuthResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Authentication"],
+)
+def register(payload: RegisterRequest) -> AuthResponse:
+    try:
+        user, token, expires_at = account_repository.register(
+            payload.name, payload.email, payload.password, payload.phone
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return AuthResponse(
+        access_token=token,
+        expires_at=expires_at,
+        user=UserResponse.model_validate(user),
+    )
+
+
+@app.post(
+    "/api/v1/auth/login",
+    response_model=AuthResponse,
+    tags=["Authentication"],
+)
+def login(payload: LoginRequest) -> AuthResponse:
+    result = account_repository.login(payload.email, payload.password)
+    if result is None:
+        raise HTTPException(status_code=401, detail="invalid email or password")
+    user, token, expires_at = result
+    return AuthResponse(
+        access_token=token,
+        expires_at=expires_at,
+        user=UserResponse.model_validate(user),
+    )
+
+
+@app.post(
+    "/api/v1/auth/logout",
+    response_model=MessageResponse,
+    tags=["Authentication"],
+)
+def logout(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _: UserResponse = Depends(get_current_user),
+) -> MessageResponse:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    account_repository.logout(credentials.credentials)
+    return MessageResponse(message="logged out")
+
+
+@app.get(
+    "/api/v1/auth/me",
+    response_model=UserResponse,
+    tags=["Authentication"],
+)
+def get_profile(
+    current_user: UserResponse = Depends(get_current_user),
+) -> UserResponse:
+    return current_user
+
+
+@app.patch(
+    "/api/v1/auth/me",
+    response_model=CustomerResponse,
+    tags=["Authentication"],
+)
+def update_profile(
+    payload: ProfileUpdate,
+    current_user: UserResponse = Depends(get_current_user),
+) -> CustomerResponse:
+    if current_user.customer_id is None:
+        raise HTTPException(status_code=400, detail="admin user has no customer profile")
+    customer = account_repository.update_profile(
+        current_user.customer_id, payload.model_dump(exclude_unset=True)
+    )
+    if customer is None:
+        raise HTTPException(status_code=404, detail="customer not found")
+    return CustomerResponse.model_validate(customer)
+
+
+@app.get(
+    "/api/v1/customers",
+    response_model=list[CustomerResponse],
+    tags=["Customers"],
+)
+def list_customers(
+    _: UserResponse = Depends(require_admin),
+) -> list[CustomerResponse]:
+    return [
+        CustomerResponse.model_validate(customer)
+        for customer in account_repository.list_customers()
+    ]
+
+
+@app.post(
+    "/api/v1/customers",
+    response_model=CustomerResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Customers"],
+)
+def create_customer(
+    payload: CustomerCreate,
+    _: UserResponse = Depends(require_admin),
+) -> CustomerResponse:
+    try:
+        customer = account_repository.create_customer(
+            payload.name, payload.email, payload.phone
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return CustomerResponse.model_validate(customer)
+
+
+@app.post(
+    "/api/v1/customers/{customer_id}/user",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Customers"],
+)
+def provision_customer_user(
+    customer_id: UUID,
+    payload: ProvisionCustomerAccountRequest,
+    _: UserResponse = Depends(require_admin),
+) -> UserResponse:
+    try:
+        user = account_repository.provision_customer_user(
+            customer_id, payload.password
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return UserResponse.model_validate(user)
+
+
+@app.get(
+    "/api/v1/customers/{customer_id}",
+    response_model=CustomerResponse,
+    tags=["Customers"],
+)
+def get_customer(
+    customer_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+) -> CustomerResponse:
+    require_customer_access(customer_id, current_user)
+    customer = account_repository.get_customer(customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="customer not found")
+    return CustomerResponse.model_validate(customer)
+
+
+@app.patch(
+    "/api/v1/customers/{customer_id}",
+    response_model=CustomerResponse,
+    tags=["Customers"],
+)
+def update_customer(
+    customer_id: UUID,
+    payload: CustomerUpdate,
+    _: UserResponse = Depends(require_admin),
+) -> CustomerResponse:
+    try:
+        customer = account_repository.update_customer(
+            customer_id, payload.model_dump(exclude_unset=True)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if customer is None:
+        raise HTTPException(status_code=404, detail="customer not found")
+    return CustomerResponse.model_validate(customer)
+
+
+@app.delete(
+    "/api/v1/customers/{customer_id}",
+    response_model=MessageResponse,
+    tags=["Customers"],
+)
+def deactivate_customer(
+    customer_id: UUID,
+    _: UserResponse = Depends(require_admin),
+) -> MessageResponse:
+    if not account_repository.deactivate_customer(customer_id):
+        raise HTTPException(status_code=404, detail="active customer not found")
+    return MessageResponse(message="customer deactivated")
+
+
+@app.get(
+    "/api/v1/customers/{customer_id}/accounts",
+    response_model=list[PaymentAccountResponse],
+    tags=["Payment Accounts"],
+)
+def list_payment_accounts(
+    customer_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+) -> list[PaymentAccountResponse]:
+    require_customer_access(customer_id, current_user)
+    if account_repository.get_customer(customer_id) is None:
+        raise HTTPException(status_code=404, detail="customer not found")
+    return [
+        PaymentAccountResponse.model_validate(account)
+        for account in account_repository.list_payment_accounts(customer_id)
+    ]
+
+
+@app.post(
+    "/api/v1/customers/{customer_id}/accounts",
+    response_model=PaymentAccountResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Payment Accounts"],
+)
+def create_payment_account(
+    customer_id: UUID,
+    payload: PaymentAccountCreate,
+    current_user: UserResponse = Depends(get_current_user),
+) -> PaymentAccountResponse:
+    require_customer_access(customer_id, current_user)
+    if account_repository.get_customer(customer_id) is None:
+        raise HTTPException(status_code=404, detail="customer not found")
+    account = account_repository.create_payment_account(
+        customer_id,
+        payload.label,
+        payload.provider,
+        payload.account_type,
+        payload.last4,
+    )
+    return PaymentAccountResponse.model_validate(account)
+
+
+@app.delete(
+    "/api/v1/customers/{customer_id}/accounts/{account_id}",
+    response_model=MessageResponse,
+    tags=["Payment Accounts"],
+)
+def deactivate_payment_account(
+    customer_id: UUID,
+    account_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+) -> MessageResponse:
+    require_customer_access(customer_id, current_user)
+    if not account_repository.deactivate_payment_account(customer_id, account_id):
+        raise HTTPException(status_code=404, detail="payment account not found")
+    return MessageResponse(message="payment account deactivated")
+
+
 @app.post(
     "/api/v1/payments",
     response_model=PaymentResponse,
@@ -65,7 +365,10 @@ def health_check() -> dict[str, str]:
 def create_payment(
     payload: PaymentCreate,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: UserResponse = Depends(get_current_user),
 ) -> PaymentResponse:
+    if current_user.role != "admin" and current_user.customer_id != payload.customer_id:
+        raise HTTPException(status_code=403, detail="payment customer access denied")
     key = idempotency_key.strip() if idempotency_key else None
     if key == "":
         raise HTTPException(status_code=400, detail="Idempotency-Key must not be blank")
@@ -90,8 +393,11 @@ def create_payment(
     tags=["Payments"],
     summary="List payments",
 )
-def list_payments() -> list[PaymentResponse]:
-    return payment_repository.list()
+def list_payments(
+    current_user: UserResponse = Depends(get_current_user),
+) -> list[PaymentResponse]:
+    customer_id = current_user.customer_id if current_user.role == "customer" else None
+    return payment_repository.list(customer_id)
 
 
 @app.get(
@@ -100,10 +406,14 @@ def list_payments() -> list[PaymentResponse]:
     tags=["Payments"],
     summary="Get payment by ID",
 )
-def get_payment(payment_id: str) -> PaymentResponse:
+def get_payment(
+    payment_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+) -> PaymentResponse:
     if payment_id.isdigit() and int(payment_id) < 1:
         raise HTTPException(status_code=400, detail="invalid payment id")
-    payment = payment_repository.get(payment_id)
+    customer_id = current_user.customer_id if current_user.role == "customer" else None
+    payment = payment_repository.get(payment_id, customer_id)
     if payment is None:
         raise HTTPException(status_code=404, detail="payment not found")
     return payment
@@ -176,6 +486,7 @@ def _filter_payments(
 def payment_summary(
     from_date: date | None = Query(default=None, alias="from"),
     to_date: date | None = Query(default=None, alias="to"),
+    _: UserResponse = Depends(require_admin),
 ) -> dict[str, list[dict[str, int | Decimal | str]]]:
     totals: dict[tuple[str, str], dict[str, int | Decimal]] = defaultdict(
         lambda: {"count": 0, "amount": 0}
@@ -200,6 +511,7 @@ def payment_summary(
 def daily_payments(
     from_date: date | None = Query(default=None, alias="from"),
     to_date: date | None = Query(default=None, alias="to"),
+    _: UserResponse = Depends(require_admin),
 ) -> dict[str, list[dict[str, int | Decimal | str]]]:
     totals: dict[tuple[str, str], dict[str, int | Decimal]] = defaultdict(
         lambda: {"count": 0, "amount": 0}

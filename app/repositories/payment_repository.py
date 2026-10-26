@@ -60,16 +60,29 @@ class PaymentRepository:
             self._next_id += 1
             return payment
 
-    def list(self) -> list[PaymentResponse]:
+    def list(self, customer_id: UUID | None = None) -> list[PaymentResponse]:
         with self._lock:
-            return list(self._payments.values())
+            payments = self._payments.values()
+            if customer_id is not None:
+                return [
+                    payment
+                    for payment in payments
+                    if payment.customer_id == str(customer_id)
+                ]
+            return list(payments)
 
-    def get(self, payment_id: str | int) -> PaymentResponse | None:
+    def get(
+        self, payment_id: str | int, customer_id: UUID | None = None
+    ) -> PaymentResponse | None:
         with self._lock:
             try:
-                return self._payments.get(int(payment_id))
+                payment = self._payments.get(int(payment_id))
             except ValueError:
                 return None
+            if payment and customer_id is not None:
+                if payment.customer_id != str(customer_id):
+                    return None
+            return payment
 
     def apply_webhook(self, event_id: str, reference: str, status: str) -> PaymentResponse:
         with self._lock:
@@ -177,20 +190,25 @@ class PostgresPaymentRepository:
                 raise ValueError("idempotency key already exists") from exc
             raise
 
-    def list(self) -> list[PaymentResponse]:
+    def list(self, customer_id: UUID | None = None) -> list[PaymentResponse]:
+        customer_filter = "WHERE customer_id = %s" if customer_id else ""
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, payment_number, customer_id, amount, currency, method,
                        status, gateway, gateway_transaction_id, paid_at,
                        description, created_at, updated_at
                 FROM payments
+                {customer_filter}
                 ORDER BY created_at DESC NULLS LAST, payment_number
-                """
+                """,
+                (customer_id,) if customer_id else (),
             ).fetchall()
         return [self._to_payment_response(row) for row in rows]
 
-    def get(self, payment_id: str | int) -> PaymentResponse | None:
+    def get(
+        self, payment_id: str | int, customer_id: UUID | None = None
+    ) -> PaymentResponse | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -198,9 +216,10 @@ class PostgresPaymentRepository:
                        status, gateway, gateway_transaction_id, paid_at,
                        description, created_at, updated_at
                 FROM payments
-                WHERE id::text = %s OR payment_number = %s
+                WHERE (id::text = %s OR payment_number = %s)
+                  AND (%s::uuid IS NULL OR customer_id = %s)
                 """,
-                (str(payment_id), str(payment_id)),
+                (str(payment_id), str(payment_id), customer_id, customer_id),
             ).fetchone()
         return self._to_payment_response(row) if row else None
 
